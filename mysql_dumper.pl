@@ -35,8 +35,13 @@ GetOptions(
 
 $directory .= "/" . $database;
 
-# Set the mysql password so we don't expose it on the command line
-$ENV{'MYSQL_PWD'} = $password;
+if ( $password ) {
+    # If the password has been passed in on the command line, set the env variable
+    $ENV{'MYSQL_PWD'} = $password;
+} else {
+    # Alternatively, assume it's already in the env variable, and copy it
+    $password = $ENV{'MYSQL_PWD'};
+}
 
 sub get_dbh {
     
@@ -277,7 +282,11 @@ if ( $action eq 'dump' ) {
       , $directory . ".tar"
       , $directory
     );
-
+    
+    # Rename it ... final name will be {database}.accel.dump
+    # ... which is useful for my case to differentiate from other dumps
+    rename $directory . ".tar" , $directory . ".accel.dump";
+    
 }
 
 if ( $action eq 'restore' ) {
