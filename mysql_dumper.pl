@@ -1,3 +1,5 @@
+#!/usr/bin/perl
+
 use strict;
 use warnings;
 
@@ -32,6 +34,39 @@ GetOptions(
   , 'jobs=i'      => \$jobs
   , 'directory=s' => \$directory
 );
+
+# Check args
+if ( ! $host ) {
+    warn( "No --host passed. Defaulting to localhost" );
+    $host = "localhost";
+}
+
+if ( ! $port ) {
+    say "No --port passed. Defaulting to 3306";
+    $port = 3306;
+}
+
+if ( ! $username ) {
+    die( "You need to pass a --username" );
+}
+
+if ( ! $database ) {
+    die( "You need to pass a --database" );
+}
+
+if ( ! $action || ( $action ne "dump" && $action ne "restore" ) ) {
+    die( "You need to pass an --action ... and it needs to be either 'dump' or 'restore'" );
+}
+
+if ( ! $jobs ) {
+    say "No --jobs passed. Defaulting to 4";
+    $jobs = 4;
+}
+
+if ( ! $directory ) {
+    warn( "No --directory passed. Defaulting to /tmp" );
+    $directory = "/tmp";
+}
 
 $directory .= "/" . $database;
 
@@ -72,7 +107,7 @@ sub dump_table {
     
     say "Dumping table: [$table]";
     
-    my $file_path = $directory . "/" . $table . ".csv.bz2";
+    my $file_path = $directory . "/" . $table . ".csv.gz";
     
 #    open my $csv_file, ">utf8", $file_path
 #        || die( "Failed to open file for writing: [$file_path]\n" . $! );
@@ -218,7 +253,7 @@ if ( $action eq 'dump' ) {
 
         $dbh->disconnect; # We don't want to keep this around if we're going to fork
                 
-        my $active_processes;
+        my $active_processes = 0;
         
         my $pid_to_table_map;
         
