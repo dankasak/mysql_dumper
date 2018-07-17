@@ -8,9 +8,13 @@ use v5.10;
 use DBI;
 use Getopt::Long;
 use File::Basename;
+use File::Find::Rule;
+use File::Path qw | make_path rmtree |;
 use Text::CSV;
 
 use Data::Dumper;
+
+use constant MAX_ERRORS_PER_TABLE     => 5;
 
 # @formatter:off
 
@@ -22,6 +26,8 @@ my ( $host
    , $action
    , $jobs
    , $directory
+   , $sample
+   , $file
 );
 
 GetOptions(
@@ -33,6 +39,8 @@ GetOptions(
   , 'action=s'    => \$action
   , 'jobs=i'      => \$jobs
   , 'directory=s' => \$directory
+  , 'sample=i'    => \$sample
+  , 'file=s'      => \$file
 );
 
 # Check args
@@ -56,6 +64,8 @@ if ( ! $database ) {
 
 if ( ! $action || ( $action ne "dump" && $action ne "restore" ) ) {
     die( "You need to pass an --action ... and it needs to be either 'dump' or 'restore'" );
+} elsif ( $action eq 'restore' && ! $file ) {
+    die( "For '--action restore' mode, you need to pass a '--file' arg" )
 }
 
 if ( ! $jobs ) {
@@ -68,7 +78,7 @@ if ( ! $directory ) {
     $directory = "/tmp";
 }
 
-$directory .= "/" . $database;
+my $db_directory = $directory . "/" . $database;
 
 if ( $password ) {
     # If the password has been passed in on the command line, set the env variable
@@ -107,60 +117,86 @@ sub dump_table {
     
     say "Dumping table: [$table]";
     
-    my $file_path = $directory . "/" . $table . ".csv.gz";
-    
-#    open my $csv_file, ">utf8", $file_path
-#        || die( "Failed to open file for writing: [$file_path]\n" . $! );
+    my $file_path = $db_directory . "/" . $table . ".csv.gz";
 
-    open( my $csv_file, "| /bin/gzip > $file_path" )
-        || die( "Failed to open file for writing: [$file_path]\n" . $! );
+    my $error_count = 0;
+    my $done        = 0;
+    my $counter     = 0;
 
-    binmode( $csv_file, ":utf8" );
+    while ( ( ! $done ) && $error_count < MAX_ERRORS_PER_TABLE ) {
 
-    my $sth = $dbh->prepare( "select * from $table" )
-        || die( $dbh->errstr );
-    
-    $sth->execute()
-        || die( $sth->errstr );
-    
-    my $csv_writer = Text::CSV_XS->new(
-        {
-            quote_char     => '"'
-          , binary         => 1
-          , eol            => "\n"
-          , sep_char       => ","
-          , escape_char    => "\\"
-          , quote_space    => 1
-          , always_quote   => 0
-          , undef_str      => "\\N"
+        if ( $error_count ) {
+            say "Retrying table [$table] - attempt #" . $error_count;
         }
-    );
-    
-    # Write CSV header ( ie columns )
-    my $fields = $sth->{NAME};
-    print $csv_file join( "," , @{$fields} ) . "\n";
-    
-    my $page_no = 0;
-    my $counter = 0;
-    
-    while ( my $page = $sth->fetchall_arrayref( undef, 10000 ) ) {
 
-        $page_no ++;
-        say( "[$table] - Fetched page [" . comma_separated( $page_no ) . "]" );
-        
-        foreach my $record ( @{$page} ) {
-            $csv_writer->print( $csv_file, $record );
-            $counter ++;
+        open( my $csv_file, "| /bin/gzip > $file_path" )
+            || die( "Failed to open file for writing: [$file_path]\n" . $! );
+
+        binmode( $csv_file, ":utf8" );
+
+        my $sql = "select * from $table";
+
+        if ( $sample ) {
+            $sql .= " limit $sample";
         }
-        
-    };
-    
+
+        my $sth = $dbh->prepare( $sql )
+            || die( $dbh->errstr );
+
+        $sth->execute()
+            || die( $sth->errstr );
+
+        my $csv_writer = Text::CSV_XS->new(
+            {
+                quote_char     => '"'
+              , binary         => 1
+              , eol            => "\n"
+              , sep_char       => ","
+              , escape_char    => "\\"
+              , quote_space    => 1
+              , always_quote   => 0
+              , undef_str      => "\\N"
+            }
+        );
+
+        # Write CSV header ( ie columns )
+        my $fields = $sth->{NAME};
+        print $csv_file join( "," , @{$fields} ) . "\n";
+
+        my $page_no = 0;
+
+        eval {
+            while ( my $page = $sth->fetchall_arrayref( undef, 10000 ) ) {
+                $page_no ++;
+                say( "[$table] - Fetched page [" . comma_separated( $page_no ) . "]" );
+                foreach my $record ( @{$page} ) {
+                    $csv_writer->print( $csv_file, $record );
+                    $counter ++;
+                }
+            };
+        };
+
+        my $err = $@;
+
+        if ( $err ) {
+            warn( "Encountered fatal error while dumping [$table]:\n$err" );
+            $error_count ++;
+        } else {
+            $done = 1;
+        }
+
+        close $csv_file
+            or die( "Failed to close file!\n" . $! );
+
+    }
+
+    if ( ! $done ) {
+        die( "Gave up dumping table [$table] - too many errors ( " . MAX_ERRORS_PER_TABLE . " )" );
+    }
+
     say( "========================================\n"
        . "[$table] - Wrote total of [" . comma_separated( $counter ) . "] records" );
-    
-    close $csv_file
-        or die( "Failed to close file!\n" . $! );
-    
+
 }
 
 sub restore_table {
@@ -193,8 +229,8 @@ sub comma_separated {
 }
 
 if ( $action eq 'dump' ) {
-    
-    mkdir( $directory );
+
+    make_path( $db_directory );
     
     # First, we dump the schema ...
     my $remove_definer_cmd = "sed '"
@@ -214,7 +250,7 @@ if ( $action eq 'dump' ) {
       , "-u" , $username 
       , $database
       , "|" , $remove_definer_cmd
-      , ">" , $directory . "/schema.ddl"
+      , ">" , $db_directory . "/schema.ddl"
     );
 
     my $args_string = join( " ", @cmd );
@@ -246,17 +282,16 @@ if ( $action eq 'dump' ) {
     while ( my $row = $sth->fetchrow_hashref ) {
         push @{$all_tables} , $row->{TABLE_NAME};
     }
-    
+
+    my $active_processes = 0;
+    my $pid_to_table_map;
+
     if ( $jobs > 1 ) {
         
         # In this mode, we fork worker jobs to do the dumping for us
 
         $dbh->disconnect; # We don't want to keep this around if we're going to fork
-                
-        my $active_processes = 0;
-        
-        my $pid_to_table_map;
-        
+
         foreach my $table( @{$all_tables} ) {
             
             while ( $active_processes >= $jobs ) {
@@ -310,23 +345,58 @@ if ( $action eq 'dump' ) {
         
     }
 
+    while ( $active_processes > 0 ) {
+
+        my $pid = wait
+            || die( "wait failed!\n" . $! );
+
+        $active_processes --;
+
+        my $table = $pid_to_table_map->{ $pid };
+
+        if ( $? ) {
+            die( "Worker for table [$table] with PID [$pid] failed!" );
+        } else {
+            say "Worker for table [$table] with PID [$pid] completed successfully";
+        }
+    }
+
+    chdir( $directory );
+
     system(
         "tar"
-      , "-c"
-      , "-v"
-      , $directory . ".tar"
-      , $directory
+      , "-cvf"
+      , $database . ".tar"
+      , $database
     );
     
     # Rename it ... final name will be {database}.accel.dump
     # ... which is useful for my case to differentiate from other dumps
-    rename $directory . ".tar" , $directory . ".accel.dump";
+    rename $database . ".tar" , $database . ".accel.dump";
+
+    rmtree( $database );
     
 }
 
 if ( $action eq 'restore' ) {
-
+    
+    chdir( $directory );
+    
+    say "Unpacking archive ...";
+    
     my @cmd = (
+        "tar"
+      , "-xvf"
+      , $file
+    );
+    
+    my $return = system( join( " ", @cmd ) );
+
+    $directory .= $database . "/";
+
+    chdir( $directory );
+    
+    @cmd = (
         "mysql"
       , "-h" , $host
       , "-P" , $port
@@ -337,7 +407,7 @@ if ( $action eq 'restore' ) {
     my $args_string = join( " ", @cmd );
     say $args_string;
     
-    my $return = system( $args_string );
+    $return = system( $args_string );
     
     if ( $return ) {
         die( "mysql return code: [$return]" );
