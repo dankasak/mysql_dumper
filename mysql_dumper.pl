@@ -95,7 +95,8 @@ sub get_dbh {
     . "database="  . $database
     . ";host="     . $host
     . ";port="     . $port
-    . ";mysql_use_result=1"; # prevent $dbh->execute() from pulling all results into memory
+    . ";mysql_use_result=1"     # prevent $dbh->execute() from pulling all results into memory
+    . ";mysql_compression=1";   # should give a good boost when dumping tables
     
     my $dbh = DBI->connect(
         $connection_string
@@ -201,21 +202,60 @@ sub dump_table {
 
 sub restore_table {
     
-    my ( $dbh , $table ) = @_;
-    
-    my $load_command = "load data local infile "
-                     . "'" . $table . ".csv'\n"
-                     . "into table $table\n"
-                     . "columns\n"
-                     . "    terminated by ','\n"
-                     . "    optionally enclosed by '\"'\n"
-                     . "ignore 1 rows";
-    
-    my $records = $dbh->do( $load_command )
-        || die( $dbh->errstr );
-    
-    say( "[$table] = Loaded total of [" . comma_separated( $records ) . "] records" );
-    
+    my ( $table ) = @_;
+
+    my $fifo_name = $table . ".csv";
+
+    my $result = POSIX::mkfifo( $fifo_name, 0600 )
+        || die( "Failed to create FIFO!\n" . $! );
+
+    my $pid = fork;
+
+    if ( $pid ) {
+
+        # We're the master
+
+        say "Forked process with PID [$pid] for table [$table]";
+
+        my $dbh = get_dbh();
+
+        my $load_command = "load data local infile\n"
+                         . " '" . $table . ".csv'\n"
+                         . " into table $table\n"
+                         . " columns\n"
+                         . "    terminated by ','\n"
+                         . "    optionally enclosed by '\"'\n"
+                         . " ignore 1 rows";
+
+        my $sth = $dbh->prepare( $load_command )
+            || die( $dbh->errstr );
+
+        my $records = $sth->execute()
+            || die( $dbh->errstr );
+
+        my $pid = wait
+            || die( "wait failed!\n" . $! );
+
+        if ( $? ) {
+            die( "gunzip for table [$table] with PID [$pid] failed!" );
+        }
+
+        say "Loaded [$records] records for table [$table]";
+
+    } else {
+
+        # We're the child
+
+        my $return = system( "gunzip -c " . $table . ".csv.gz > $fifo_name" );
+
+        if ( $return ) {
+            die( "gunzip returned exit code: [$return]" );
+        }
+
+        exit(0);
+
+    }
+
 }
 
 sub comma_separated {
@@ -392,6 +432,12 @@ if ( $action eq 'restore' ) {
     
     my $return = system( join( " ", @cmd ) );
 
+    if ( $return ) {
+        die( "tar return code: [$return]" );
+    } else {
+        say "tar return code: [$return]";
+    }
+
     $directory .= $database . "/";
 
     chdir( $directory );
@@ -401,7 +447,7 @@ if ( $action eq 'restore' ) {
       , "-h" , $host
       , "-P" , $port
       , "-u" , $username
-      , "<" , $directory . "/schema.ddl"
+      , "<" , $directory . "schema.ddl"
     );
     
     my $args_string = join( " ", @cmd );
@@ -419,18 +465,19 @@ if ( $action eq 'restore' ) {
     my $all_tables;
 
     push @{$all_tables}, File::Find::Rule->file()
-                                         ->name( "*.csv" )
+                                         ->name( "*.csv.gz" )
                                          ->in( $directory );
     
-    foreach my $table ( @{$all_tables} ) {
-        $table =~ s/\.csv//;
+    foreach my $table_name ( @{$all_tables} ) {
+        $table_name =~ s/\.csv\.gz//;   # strip trailing ".csv.gz"
+        $table_name =~ s/.*\///;        # strip directory component ( leaving filename )
     }
      
     if ( $jobs > 1 ) {
         
         # In this mode, we fork worker jobs to do the restoring for us
         
-        my $active_processes;
+        my $active_processes = 0;
         
         my $pid_to_table_map;
         
@@ -465,11 +512,8 @@ if ( $action eq 'restore' ) {
                 $pid_to_table_map->{ $pid } = $table;
                 
             } else {
-                
-                # We're the child
-                my $dbh = get_dbh();
-                
-                restore_table( $dbh , $table );
+
+                restore_table( $table );
                 
                 exit(0);
                 
@@ -481,10 +525,8 @@ if ( $action eq 'restore' ) {
         
         # In this mode, we do the dumping ourself, in a transaction ( for a consistent snapshot )
 
-        my $dbh = get_dbh();
-
         foreach my $table( @{$all_tables} ) {
-            restore_table( $dbh , $table );
+            restore_table( $table );
         }
         
     }
