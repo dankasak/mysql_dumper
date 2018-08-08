@@ -10,6 +10,7 @@ use Getopt::Long;
 use File::Basename;
 use File::Find::Rule;
 use File::Path qw | make_path rmtree |;
+use POSIX;
 use Text::CSV;
 
 use Data::Dumper;
@@ -43,6 +44,26 @@ GetOptions(
   , 'file=s'      => \$file
 );
 
+sub pretty_timestamp {
+
+    # This function returns the current time as a human-readable timestamp
+    #  ... without having to install further date/time manipulation libraries
+
+    my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime( time );
+
+    #               print mask ... see sprintf
+    return sprintf( "%04d%02d%02d_%02d%02d%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec );
+
+}
+
+sub logline {
+
+    my $msg = shift;
+
+    say pretty_timestamp() . " " . $msg;
+
+}
+
 # Check args
 if ( ! $host ) {
     warn( "No --host passed. Defaulting to localhost" );
@@ -50,7 +71,7 @@ if ( ! $host ) {
 }
 
 if ( ! $port ) {
-    say "No --port passed. Defaulting to 3306";
+    logline( "No --port passed. Defaulting to 3306" );
     $port = 3306;
 }
 
@@ -69,13 +90,13 @@ if ( ! $action || ( $action ne "dump" && $action ne "restore" ) ) {
 }
 
 if ( ! $jobs ) {
-    say "No --jobs passed. Defaulting to 4";
+    logline( "No --jobs passed. Defaulting to 4" );
     $jobs = 4;
 }
 
 if ( ! $directory ) {
     warn( "No --directory passed. Defaulting to /tmp" );
-    $directory = "/tmp";
+    $directory = "/tmp/";
 }
 
 my $db_directory = $directory . "/" . $database;
@@ -112,28 +133,38 @@ sub get_dbh {
         
 }
 
+sub open_dump_file {
+
+    my ( $table , $counter ) = @_;
+
+    my $padded_counter = sprintf "%06d", $counter; # We want to make sure these are dumped / restored in order
+
+    my $file_path = $db_directory . "/" . $table . "." . $padded_counter . ".csv.gz";
+
+    open( my $csv_file, "| /bin/gzip > $file_path" )
+       || die( "Failed to open file for writing: [$file_path]\n" . $! );
+
+    binmode( $csv_file, ":utf8" );
+
+    return $csv_file;
+
+}
+
 sub dump_table {
     
     my ( $dbh , $table ) = @_;
-    
-    say "Dumping table: [$table]";
-    
-    my $file_path = $db_directory . "/" . $table . ".csv.gz";
 
-    my $error_count = 0;
-    my $done        = 0;
-    my $counter     = 0;
+    logline( "Dumping table: [$table]" );
+
+    my $error_count  = 0;
+    my $done         = 0;
+    my $counter      = 0;
 
     while ( ( ! $done ) && $error_count < MAX_ERRORS_PER_TABLE ) {
 
         if ( $error_count ) {
-            say "Retrying table [$table] - attempt #" . $error_count;
+            logline( "Retrying table [$table] - attempt #" . $error_count );
         }
-
-        open( my $csv_file, "| /bin/gzip > $file_path" )
-            || die( "Failed to open file for writing: [$file_path]\n" . $! );
-
-        binmode( $csv_file, ":utf8" );
 
         my $sql = "select * from $table";
 
@@ -160,16 +191,27 @@ sub dump_table {
             }
         );
 
-        # Write CSV header ( ie columns )
         my $fields = $sth->{NAME};
-        print $csv_file join( "," , @{$fields} ) . "\n";
 
         my $page_no = 0;
+        my $csv_file;
+        my $file_open = 0;
 
         eval {
-            while ( my $page = $sth->fetchall_arrayref( undef, 10000 ) ) {
+            while ( my $page = $sth->fetchall_arrayref( undef, 10000 ) ) { # We want to pull 10,000 records at a time
+                logline( "[$table] - Fetched page [" . comma_separated( $page_no ) . "]" );
                 $page_no ++;
-                say( "[$table] - Fetched page [" . comma_separated( $page_no ) . "]" );
+                if ( $counter && $counter % 1000000 == 0 ) { # We want approx 1,000,000 records per file
+                    close $csv_file
+                        or die( "Failed to close file!\n" . $! );
+                    $file_open = 0;
+                }
+                if ( ! $file_open ) {
+                    $csv_file = open_dump_file( $table , $page_no );
+                    # Write CSV header ( ie columns )
+                    print $csv_file join( "," , @{$fields} ) . "\n";
+                    $file_open = 1;
+                }
                 foreach my $record ( @{$page} ) {
                     $csv_writer->print( $csv_file, $record );
                     $counter ++;
@@ -186,8 +228,10 @@ sub dump_table {
             $done = 1;
         }
 
-        close $csv_file
-            or die( "Failed to close file!\n" . $! );
+        if ( $file_open ) {
+            close $csv_file
+                or die( "Failed to close file!\n" . $! );
+        }
 
     }
 
@@ -195,64 +239,76 @@ sub dump_table {
         die( "Gave up dumping table [$table] - too many errors ( " . MAX_ERRORS_PER_TABLE . " )" );
     }
 
-    say( "========================================\n"
+    logline( "========================================\n"
        . "[$table] - Wrote total of [" . comma_separated( $counter ) . "] records" );
 
 }
 
 sub restore_table {
     
-    my ( $table ) = @_;
+    my ( $table , $table_file_list ) = @_;
 
     my $fifo_name = $table . ".csv";
 
-    my $result = POSIX::mkfifo( $fifo_name, 0600 )
-        || die( "Failed to create FIFO!\n" . $! );
+    foreach my $file ( @{$table_file_list} ) {
 
-    my $pid = fork;
+        unlink( $fifo_name );
 
-    if ( $pid ) {
+        my $result = POSIX::mkfifo( $fifo_name, 0600 )
+            || die( "Failed to create FIFO!\n" . $! );
 
-        # We're the master
+        my $pid = fork;
 
-        say "Forked process with PID [$pid] for table [$table]";
+        if ( $pid ) {
 
-        my $dbh = get_dbh();
+            # We're the master
 
-        my $load_command = "load data local infile\n"
-                         . " '" . $table . ".csv'\n"
-                         . " into table $table\n"
-                         . " columns\n"
-                         . "    terminated by ','\n"
-                         . "    optionally enclosed by '\"'\n"
-                         . " ignore 1 rows";
+            logline( "Forked process with PID [$pid] for table [$table]" );
 
-        my $sth = $dbh->prepare( $load_command )
-            || die( $dbh->errstr );
+            my $dbh = get_dbh();
 
-        my $records = $sth->execute()
-            || die( $dbh->errstr );
+            $dbh->do( "set foreign_key_checks=0" )
+                || die( $dbh->errstr );
 
-        my $pid = wait
-            || die( "wait failed!\n" . $! );
+            $dbh->do( "set unique_checks=0" )
+                || die( $dbh->errstr );
 
-        if ( $? ) {
-            die( "gunzip for table [$table] with PID [$pid] failed!" );
+            my $load_command = "load data local infile\n"
+                             . " '" . $table . ".csv'\n"
+                             . " into table $table\n"
+                             . " columns\n"
+                             . "    terminated by ','\n"
+                             . "    optionally enclosed by '\"'\n"
+                             . " ignore 1 rows";
+
+            my $sth = $dbh->prepare( $load_command )
+                || die( $dbh->errstr );
+
+            my $records = $sth->execute()
+                || die( $dbh->errstr );
+
+            $pid = wait # it will be the same PID, and we don't use it anyway ( other than loglineging it )
+                || die( "wait failed!\n" . $! );
+
+            if ( $? ) {
+                die( "gunzip for table [$table] with PID [$pid] failed!" );
+            }
+
+            logline( "Loaded [$records] records for table [$table] from file [$file]" );
+
+        } else {
+
+            # We're the child
+
+            my $return = system( "gunzip -c $file > $fifo_name" );
+
+            if ( $return ) {
+                die( "gunzip returned exit code: [$return]" );
+            }
+
+            exit(0);
+
         }
-
-        say "Loaded [$records] records for table [$table]";
-
-    } else {
-
-        # We're the child
-
-        my $return = system( "gunzip -c " . $table . ".csv.gz > $fifo_name" );
-
-        if ( $return ) {
-            die( "gunzip returned exit code: [$return]" );
-        }
-
-        exit(0);
 
     }
 
@@ -294,14 +350,14 @@ if ( $action eq 'dump' ) {
     );
 
     my $args_string = join( " ", @cmd );
-    say $args_string;
+    logline( $args_string );
 
     my $return = system( $args_string );
 
     if ( $return ) {
         die( "mysqldump return code: [$return]" );
     } else {
-        say "mysqldump return code: [$return]";
+        logline( "mysqldump return code: [$return]" );
     }
     
     # Next, we dump the data ...
@@ -346,7 +402,7 @@ if ( $action eq 'dump' ) {
                 if ( $? ) {
                     die( "Worker for table [$table] with PID [$pid] failed!" );
                 } else {
-                    say "Worker for table [$table] with PID [$pid] completed successfully";
+                    logline( "Worker for table [$table] with PID [$pid] completed successfully" );
                 }
             }
             
@@ -358,7 +414,7 @@ if ( $action eq 'dump' ) {
                 # Increment the number of active processes
                 $active_processes ++;
                 
-                say "Forked process with PID [$pid] for table [$table]";
+                logline( "Forked process with PID [$pid] for table [$table]" );
                 
                 $pid_to_table_map->{ $pid } = $table;
                 
@@ -397,7 +453,7 @@ if ( $action eq 'dump' ) {
         if ( $? ) {
             die( "Worker for table [$table] with PID [$pid] failed!" );
         } else {
-            say "Worker for table [$table] with PID [$pid] completed successfully";
+            logline( "Worker for table [$table] with PID [$pid] completed successfully" );
         }
     }
 
@@ -422,7 +478,7 @@ if ( $action eq 'restore' ) {
     
     chdir( $directory );
     
-    say "Unpacking archive ...";
+    logline( "Unpacking archive ..." );
     
     my @cmd = (
         "tar"
@@ -435,7 +491,7 @@ if ( $action eq 'restore' ) {
     if ( $return ) {
         die( "tar return code: [$return]" );
     } else {
-        say "tar return code: [$return]";
+        logline( "tar return code: [$return]" );
     }
 
     $directory .= $database . "/";
@@ -451,28 +507,38 @@ if ( $action eq 'restore' ) {
     );
     
     my $args_string = join( " ", @cmd );
-    say $args_string;
+    logline( $args_string );
     
     $return = system( $args_string );
     
     if ( $return ) {
         die( "mysql return code: [$return]" );
     } else {
-        say "mysql return code: [$return]";
+        logline( "mysql return code: [$return]" );
     }
     
     # Next, we restore the data ...
+    # Here, we get a list of tables. The files we have are in the form table.000001.csv.gz ... table.000002.csv.gz ... etc
+    # We split each table into a manageable size. MySQL seems to choke loading very large files in 1 go.
+    # Note that we DON'T want to have multiple concurrent inserts into the SAME table. So we aggregate our list of files
+    # into unique tables, then call restore_table() on each of these.
+    # restore_table() will then be responsible for loading ALL files for that table, sequentially.
+    #
+    my $all_files_array;
     my $all_tables;
 
-    push @{$all_tables}, File::Find::Rule->file()
-                                         ->name( "*.csv.gz" )
-                                         ->in( $directory );
+    push @{$all_files_array}, sort( File::Find::Rule->file()
+                                                    ->name( "*.csv.gz" )
+                                                    ->in( $directory )
+    );
     
-    foreach my $table_name ( @{$all_tables} ) {
-        $table_name =~ s/\.csv\.gz//;   # strip trailing ".csv.gz"
+    foreach my $file_name ( @{$all_files_array} ) {
+        my $table_name = $file_name;
+        $table_name =~ s/\.(\d*)\.csv\.gz//;   # strip trailing ".00001.csv.gz"
         $table_name =~ s/.*\///;        # strip directory component ( leaving filename )
+        push @{ $all_tables->{ $table_name } }, $file_name;
     }
-     
+
     if ( $jobs > 1 ) {
         
         # In this mode, we fork worker jobs to do the restoring for us
@@ -481,7 +547,7 @@ if ( $action eq 'restore' ) {
         
         my $pid_to_table_map;
         
-        foreach my $table( @{$all_tables} ) {
+        foreach my $table( keys %{$all_tables} ) {
             
             while ( $active_processes >= $jobs ) {
                 
@@ -495,7 +561,7 @@ if ( $action eq 'restore' ) {
                 if ( $? ) {
                     die( "Worker for table [$table] with PID [$pid] failed!" );
                 } else {
-                    say "Worker for table [$table] with PID [$pid] completed successfully";
+                    logline( "Worker for table [$table] with PID [$pid] completed successfully" );
                 }
             }
             
@@ -507,13 +573,13 @@ if ( $action eq 'restore' ) {
                 # Increment the number of active processes
                 $active_processes ++;
                 
-                say "Forked process with PID [$pid] for table [$table]";
+                logline( "Forked process with PID [$pid] for table [$table]" );
                 
                 $pid_to_table_map->{ $pid } = $table;
                 
             } else {
 
-                restore_table( $table );
+                restore_table( $table , $all_tables->{ $table } );
                 
                 exit(0);
                 
@@ -525,8 +591,8 @@ if ( $action eq 'restore' ) {
         
         # In this mode, we do the dumping ourself, in a transaction ( for a consistent snapshot )
 
-        foreach my $table( @{$all_tables} ) {
-            restore_table( $table );
+        foreach my $table( keys %{$all_tables} ) {
+            restore_table( $table , $all_tables->{ $table } );
         }
         
     }
